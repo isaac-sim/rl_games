@@ -124,7 +124,7 @@ class BasePlayer(object):
                 # without triggering the retry loop in "safe_filesystem_op()"
                 load_error = False
                 try:
-                    torch.load(self.checkpoint_to_load)
+                    torch.load(self.checkpoint_to_load, weights_only=False)
                 except Exception as e:
                     print(f"Evaluation: checkpoint file is likely corrupted {self.checkpoint_to_load}: {e}")
                     load_error = True
