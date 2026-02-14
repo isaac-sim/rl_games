@@ -531,6 +531,7 @@ class SACAgent(BaseAlgorithm):
         return self.play_steps(random_exploration)
 
     def train(self):
+        print("Training SAC Agent...")
         self.init_tensors()
         self.algo_observer.after_init(self)
         total_time = 0
