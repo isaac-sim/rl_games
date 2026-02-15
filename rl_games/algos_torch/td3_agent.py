@@ -1,5 +1,4 @@
 from rl_games.algos_torch import torch_ext
-
 from rl_games.common import vecenv
 from rl_games.common import schedulers
 from rl_games.common import experience
@@ -7,6 +6,9 @@ from rl_games.common.a2c_common import print_statistics
 
 from rl_games.interfaces.base_algorithm import  BaseAlgorithm
 from torch.utils.tensorboard import SummaryWriter
+from torch.cuda.amp import autocast
+from torch.cuda.amp import GradScaler
+import torch.nn.utils as nn_utils
 from datetime import datetime
 from rl_games.algos_torch import  model_builder
 from torch import optim
@@ -17,8 +19,7 @@ import numpy as np
 import time
 import os
 
-
-class SACAgent(BaseAlgorithm):
+class TD3Agent(BaseAlgorithm):
 
     def __init__(self, base_name, params):
 
@@ -32,12 +33,10 @@ class SACAgent(BaseAlgorithm):
         self.gamma = config["gamma"]
         self.critic_tau = float(config["critic_tau"])
         self.batch_size = config["batch_size"]
-        self.init_alpha = config["init_alpha"]
-        self.learnable_temperature = config["learnable_temperature"]
         self.replay_buffer_size = config["replay_buffer_size"]
         self.num_steps_per_episode = config.get("num_steps_per_episode", 1)
         self.normalize_input = config.get("normalize_input", False)
-
+        self.grad_norm = config.get("grad_norm", 1.0)
         # TODO: double-check! To use bootstrap instead?
         self.max_env_steps = config.get("max_env_steps", 1000) # temporary, in future we will use other approach
 
@@ -45,8 +44,9 @@ class SACAgent(BaseAlgorithm):
 
         self.num_frames_per_epoch = self.num_actors * self.num_steps_per_episode
 
-        self.log_alpha = torch.tensor(np.log(self.init_alpha)).float().to(self._device)
-        self.log_alpha.requires_grad = True
+        self.scaler = GradScaler()
+
+
         action_space = self.env_info['action_space']
         self.actions_num = action_space.shape[0]
 
@@ -76,18 +76,12 @@ class SACAgent(BaseAlgorithm):
                                                  lr=float(self.config["critic_lr"]),
                                                  betas=self.config.get("critic_betas", [0.9, 0.999]))
 
-        self.log_alpha_optimizer = torch.optim.Adam([self.log_alpha],
-                                                    lr=float(self.config["alpha_lr"]),
-                                                    betas=self.config.get("alphas_betas", [0.9, 0.999]))
-
+ 
         self.replay_buffer = experience.VectorizedReplayBuffer(self.env_info['observation_space'].shape,
         self.env_info['action_space'].shape,
         self.replay_buffer_size,
         self._device)
-        self.target_entropy_coef = config.get("target_entropy_coef", 1.0)
-        self.target_entropy = self.target_entropy_coef * -self.env_info['action_space'].shape[0]
-        print("Target entropy", self.target_entropy)
-
+ 
         self.algo_observer = config['features']['observer']
 
     def load_networks(self, params):
@@ -183,6 +177,7 @@ class SACAgent(BaseAlgorithm):
         self.last_rnn_indices = None
         self.last_state_indices = None
 
+    
     def init_tensors(self):
         if self.observation_space.dtype == np.uint8:
             torch_dtype = torch.uint8
@@ -194,10 +189,6 @@ class SACAgent(BaseAlgorithm):
         self.current_lengths = torch.zeros(batch_size, dtype=torch.long, device=self._device)
 
         self.dones = torch.zeros((batch_size,), dtype=torch.uint8, device=self._device)
-
-    @property
-    def alpha(self):
-        return self.log_alpha.exp()
 
     @property
     def device(self):
@@ -227,12 +218,11 @@ class SACAgent(BaseAlgorithm):
     def get_full_state_weights(self):
         print("Loading full weights")
         state = self.get_weights()
-
+        
         state['epoch'] = self.epoch_num
         state['frame'] = self.frame
         state['actor_optimizer'] = self.actor_optimizer.state_dict()
-        state['critic_optimizer'] = self.critic_optimizer.state_dict()
-        state['log_alpha_optimizer'] = self.log_alpha_optimizer.state_dict()        
+        state['critic_optimizer'] = self.critic_optimizer.state_dict()      
 
         return state
 
@@ -242,10 +232,8 @@ class SACAgent(BaseAlgorithm):
         if set_epoch:
             self.epoch_num = weights['epoch']
             self.frame = weights['frame']
-
         self.actor_optimizer.load_state_dict(weights['actor_optimizer'])
         self.critic_optimizer.load_state_dict(weights['critic_optimizer'])
-        self.log_alpha_optimizer.load_state_dict(weights['log_alpha_optimizer'])
 
         self.last_mean_rewards = weights.get('last_mean_rewards', -1000000000)
 
@@ -254,7 +242,7 @@ class SACAgent(BaseAlgorithm):
             self.vec_env.set_env_state(env_state)
 
     def restore(self, fn, set_epoch=True):
-        print("SAC restore")
+        print("TD3 restore")
         checkpoint = torch_ext.load_checkpoint(fn)
         self.set_full_state_weights(checkpoint, set_epoch=set_epoch)
 
@@ -274,60 +262,64 @@ class SACAgent(BaseAlgorithm):
         self.model.train()
 
     def update_critic(self, obs, action, reward, next_obs, not_done, step):
+        
         with torch.no_grad():
-            dist = self.model.actor(next_obs)
-            next_action = dist.rsample()
-            log_prob = dist.log_prob(next_action).sum(-1, keepdim=True)
+            with autocast(enabled=True):
+                dist = self.model.actor(next_obs)
+                next_action = dist.rsample()
+                log_prob = dist.log_prob(next_action).sum(-1, keepdim=True)
 
-            target_Q1, target_Q2 = self.model.critic_target(next_obs, next_action)
-            target_V = torch.min(target_Q1, target_Q2) - self.alpha * log_prob
+                target_Q1, target_Q2 = self.model.critic_target(next_obs, next_action)
+                target_V = torch.min(target_Q1, target_Q2)
 
-            target_Q = reward + (not_done * self.gamma * target_V)
-            target_Q = target_Q.detach()
+                target_Q = reward + (not_done * self.gamma * target_V)
+                target_Q = target_Q.detach()
 
-        # get current Q estimates
-        current_Q1, current_Q2 = self.model.critic(obs, action)
+        with autocast(enabled=True):
+            # get current Q estimates
+            current_Q1, current_Q2 = self.model.critic(obs, action)
 
-        critic1_loss = self.c_loss(current_Q1, target_Q)
-        critic2_loss = self.c_loss(current_Q2, target_Q)
-        critic_loss = critic1_loss + critic2_loss 
+            critic1_loss = self.c_loss(current_Q1, target_Q)
+            critic2_loss = self.c_loss(current_Q2, target_Q)
+            critic_loss = critic1_loss + critic2_loss 
+
         self.critic_optimizer.zero_grad(set_to_none=True)
-        critic_loss.backward()
-        self.critic_optimizer.step()
+
+        self.scaler.scale(critic_loss).backward()
+        self.scaler.unscale_(self.critic_optimizer)
+        nn_utils.clip_grad_norm_(
+            self.model.sac_network.critic.parameters(),
+            self.grad_norm
+        )
+
+        self.scaler.step(self.critic_optimizer)
+        self.scaler.update()
 
         return critic_loss.detach(), critic1_loss.detach(), critic2_loss.detach()
 
-    def update_actor_and_alpha(self, obs, step):
-        for p in self.model.sac_network.critic.parameters():
-            p.requires_grad = False
-
-        dist = self.model.actor(obs)
-        action = dist.rsample()
-        log_prob = dist.log_prob(action).sum(-1, keepdim=True)
-        entropy = -log_prob.mean() #dist.entropy().sum(-1, keepdim=True).mean()
-        actor_Q1, actor_Q2 = self.model.critic(obs, action)
-        actor_Q = torch.min(actor_Q1, actor_Q2)
-
-        actor_loss = (torch.max(self.alpha.detach(), self.min_alpha) * log_prob - actor_Q)
-        actor_loss = actor_loss.mean()
+    
+    def update_actor(self, obs, step):
+        with autocast(enabled=True):
+            dist = self.model.actor(obs)
+            action = dist.mean
+            actor_Q1, actor_Q2 = self.model.critic(obs, action)
+            actor_Q = torch.min(actor_Q1, actor_Q2)
+            actor_loss = -actor_Q
+            actor_loss = actor_loss.mean()
 
         self.actor_optimizer.zero_grad(set_to_none=True)
-        actor_loss.backward()
-        self.actor_optimizer.step()
+        self.scaler.scale(actor_loss).backward()
 
-        for p in self.model.sac_network.critic.parameters():
-            p.requires_grad = True
+        self.scaler.unscale_(self.actor_optimizer)
+        nn_utils.clip_grad_norm_(
+            self.model.sac_network.actor.parameters(),
+            self.grad_norm
+        )
 
-        if self.learnable_temperature:
-            alpha_loss = (self.alpha *
-                          (-log_prob - self.target_entropy).detach()).mean()
-            self.log_alpha_optimizer.zero_grad(set_to_none=True)
-            alpha_loss.backward()
-            self.log_alpha_optimizer.step()
-        else:
-            alpha_loss = None
+        self.scaler.step(self.actor_optimizer)
+        self.scaler.update()
 
-        return actor_loss.detach(), entropy.detach(), self.alpha.detach(), alpha_loss # TODO: maybe not self.alpha
+        return actor_loss.detach()
 
     def soft_update_params(self, net, target_net, tau):
         for param, target_param in zip(net.parameters(), target_net.parameters()):
@@ -342,12 +334,13 @@ class SACAgent(BaseAlgorithm):
         next_obs = self.preproc_obs(next_obs)
         critic_loss, critic1_loss, critic2_loss = self.update_critic(obs, action, reward, next_obs, not_done, step)
 
-        actor_loss, entropy, alpha, alpha_loss = self.update_actor_and_alpha(obs, step)
-
-        actor_loss_info = actor_loss, entropy, alpha, alpha_loss
+        actor_loss = self.update_actor(obs, step)
+        
+        actor_loss_info = actor_loss
         self.soft_update_params(self.model.sac_network.critic, self.model.sac_network.critic_target,
                                      self.critic_tau)
         return actor_loss_info, critic1_loss, critic2_loss
+    
 
     def preproc_obs(self, obs):
         if isinstance(obs, dict):
@@ -425,20 +418,16 @@ class SACAgent(BaseAlgorithm):
 
         return actions
 
-    def extract_actor_stats(self, actor_losses, entropies, alphas, alpha_losses, actor_loss_info):
-        actor_loss, entropy, alpha, alpha_loss = actor_loss_info
-
+    def extract_actor_stats(self, actor_losses, actor_loss_info):
+        actor_loss = actor_loss_info
         actor_losses.append(actor_loss)
-        entropies.append(entropy)
-        if alpha_losses is not None:
-            alphas.append(alpha)
-            alpha_losses.append(alpha_loss)
-
+        
     def clear_stats(self):
         self.game_rewards.clear()
         self.game_lengths.clear()
         self.mean_rewards = self.last_mean_rewards = -1000000000
         self.algo_observer.after_clear_stats()
+
 
     def play_steps(self, random_exploration = False):
         total_time_start = time.perf_counter()
@@ -446,8 +435,6 @@ class SACAgent(BaseAlgorithm):
         total_time = 0
         step_time = 0.0
         actor_losses = []
-        entropies = []
-        alphas = []
         alpha_losses = []
         critic1_losses = []
         critic2_losses = []
@@ -512,7 +499,7 @@ class SACAgent(BaseAlgorithm):
                 update_time_end = time.perf_counter()
                 update_time = update_time_end - update_time_start
 
-                self.extract_actor_stats(actor_losses, entropies, alphas, alpha_losses, actor_loss_info)
+                self.extract_actor_stats(actor_losses, actor_loss_info)
                 critic1_losses.append(critic1_loss)
                 critic2_losses.append(critic2_loss)
             else:
@@ -524,7 +511,7 @@ class SACAgent(BaseAlgorithm):
         total_time = total_time_end - total_time_start
         play_time = total_time - total_update_time
 
-        return step_time, play_time, total_update_time, total_time, actor_losses, entropies, alphas, alpha_losses, critic1_losses, critic2_losses
+        return step_time, play_time, total_update_time, total_time, actor_losses, critic1_losses, critic2_losses
 
     def train_epoch(self):
         random_exploration = self.epoch_num < self.num_warmup_steps
@@ -540,7 +527,7 @@ class SACAgent(BaseAlgorithm):
 
         while True:
             self.epoch_num += 1
-            step_time, play_time, update_time, epoch_total_time, actor_losses, entropies, alphas, alpha_losses, critic1_losses, critic2_losses = self.train_epoch()
+            step_time, play_time, update_time, epoch_total_time, actor_losses, critic1_losses, critic2_losses = self.train_epoch()
 
             total_time += epoch_total_time
 
@@ -565,11 +552,6 @@ class SACAgent(BaseAlgorithm):
                 self.writer.add_scalar('losses/a_loss', torch_ext.mean_list(actor_losses).item(), self.frame)
                 self.writer.add_scalar('losses/c1_loss', torch_ext.mean_list(critic1_losses).item(), self.frame)
                 self.writer.add_scalar('losses/c2_loss', torch_ext.mean_list(critic2_losses).item(), self.frame)
-                self.writer.add_scalar('losses/entropy', torch_ext.mean_list(entropies).item(), self.frame)
-
-                if alpha_losses[0] is not None:
-                    self.writer.add_scalar('losses/alpha_loss', torch_ext.mean_list(alpha_losses).item(), self.frame)
-                self.writer.add_scalar('info/alpha', torch_ext.mean_list(alphas).item(), self.frame)
 
             self.writer.add_scalar('info/epochs', self.epoch_num, self.frame)
             self.algo_observer.after_print_stats(self.frame, self.epoch_num, total_time)

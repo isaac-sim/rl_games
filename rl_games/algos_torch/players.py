@@ -239,3 +239,20 @@ class SACPlayer(BasePlayer):
 
     def reset(self):
         pass
+
+
+class TD3Player(SACPlayer):
+
+    def __init__(self, params):
+        super().__init__(params)
+        
+    def get_action(self, obs, is_deterministic=False):
+        if self.has_batch_dimension == False:
+            obs = unsqueeze_obs(obs)
+        obs = self.model.norm_obs(obs)
+        dist = self.model.actor(obs)
+        actions = dist.mean
+        actions = actions.clamp(*self.action_range).to(self.device)
+        if self.has_batch_dimension == False:
+            actions = torch.squeeze(actions.detach())
+        return actions
