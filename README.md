@@ -132,7 +132,7 @@ And IsaacGymEnvs: https://github.com/NVIDIA-Omniverse/IsaacGymEnvs
 *Atari Pong*
 
 ```bash
-poetry install -E atari
+poetry install -E atari -E wandb
 poetry run python runner.py --train --file rl_games/configs/atari/ppo_pong.yaml
 poetry run python runner.py --play --file rl_games/configs/atari/ppo_pong.yaml --checkpoint nn/PongNoFrameskip.pth
 ```
@@ -398,4 +398,3 @@ Additional environment supported properties and functions
 
 * Running a single environment with Isaac Gym can cause crash, if it happens switch to at least 2 environments simulated in parallel
     
-
